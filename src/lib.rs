@@ -15,7 +15,6 @@ use std::sync::mpsc;
 use std::mem::MaybeUninit;
 use std::sync::mpsc::{ Sender, Receiver };
 use std::thread;
-use std::time::Instant;
 
 struct LuaFileData {
     pub file_data: Vec<u8>,
