@@ -5,12 +5,12 @@ use windows::{
     core::{ w, s }
 };
 
-use std::ffi::{ c_char, CStr };
+use std::{ffi::{ c_char, CStr, c_void }, mem::transmute};
 use std::path::{ Path, PathBuf };
 use std::fs::{ OpenOptions, create_dir_all };
 use std::io::Write;
 use regex::Regex;
-use detour::static_detour;
+use minhook_sys::*;
 use std::sync::mpsc;
 use std::mem::MaybeUninit;
 use std::sync::mpsc::{ Sender, Receiver };
@@ -27,12 +27,9 @@ static mut DRIVE_LETTER: char = 'C';
 static mut TX: MaybeUninit<Sender<LuaFileData>> = MaybeUninit::uninit();
 static mut RX: MaybeUninit<Receiver<LuaFileData>> = MaybeUninit::uninit();
 
+static mut LUA_LOADBUFFERX_ORIGINAL: *mut c_void = std::ptr::null_mut();
 
 const BAD_NAMES: [&str; 23] = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", ".."];
-
-static_detour! {
-    static LOADBUFFER: fn(*const u8, *const c_char, u64, *const c_char, *const u8) -> i32;
-}
 
 fn dump_file() {
     for received in unsafe { RX.assume_init_ref() } {
@@ -128,7 +125,6 @@ fn send_data_to_thread(buffer: *const c_char, len: u64, name: *const c_char) -> 
     Ok(())
 }
 
-#[allow(unused_unsafe)] // rust-analyser causes hooking crate to make red squiggly lines underneath :(
 fn lua_loadbufferx_hook(state: *const u8, buffer: *const c_char, len: u64, name: *const c_char, mode: *const u8) -> i32 {
     let result = send_data_to_thread(buffer, len, name);
     if let Err(e) = result {
@@ -149,15 +145,19 @@ fn lua_loadbufferx_hook(state: *const u8, buffer: *const c_char, len: u64, name:
         f.write_all(e.as_bytes()).unwrap();
         f.write_all(b"\n").unwrap();
     }
-    
-    return unsafe { LOADBUFFER.call(state, buffer, len, name, mode) };
+
+    let original: fn(*const u8, *const c_char, u64, *const c_char, *const u8) -> i32 = unsafe { transmute(LUA_LOADBUFFERX_ORIGINAL) };
+    return unsafe { original(state, buffer, len, name, mode) };
+
 }
 
 fn initializer() {
     unsafe {
+        MH_Initialize();
+
         let lua_shared = GetModuleHandleW(w!("lua_shared.dll")).unwrap();
         let lua_ptr = GetProcAddress(lua_shared, s!("luaL_loadbufferx")).unwrap() as *const ();
-        let lua_func: fn(*const u8, *const c_char, u64, *const c_char, *const u8) -> i32 = std::mem::transmute(lua_ptr);
+        let lua_func: fn(*const u8, *const c_char, u64, *const c_char, *const u8) -> i32 = transmute(lua_ptr);
         let (tmptx, tmprx) = mpsc::channel::<LuaFileData>();
 
         TX.write(tmptx);
@@ -172,9 +172,10 @@ fn initializer() {
             .next()
             .unwrap(); // getting drive letter from game path
 
-        LOADBUFFER.initialize(lua_func, lua_loadbufferx_hook).unwrap();
-        
-        LOADBUFFER.enable().unwrap();
+        let lua_function_ptr: *mut c_void = transmute(lua_ptr);
+        MH_CreateHook(transmute(lua_ptr), lua_loadbufferx_hook as *mut c_void, &mut LUA_LOADBUFFERX_ORIGINAL);
+
+        MH_EnableHook(lua_function_ptr);
 
         thread::spawn(dump_file);
     }
